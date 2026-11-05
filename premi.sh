@@ -184,6 +184,7 @@ print_install "Membuat direktori xray"
     chmod +x /var/log/xray
     touch /var/log/xray/access.log
     touch /var/log/xray/error.log
+    chown www-data.www-data /var/log/xray/access.log /var/log/xray/error.log
     mkdir -p /var/lib/kyt >/dev/null 2>&1
     # // Ram Information
     while IFS=":" read -r a b; do
@@ -213,8 +214,8 @@ function first_setup(){
     echo "Setup Dependencies $(cat /etc/os-release | grep -w PRETTY_NAME | head -n1 | sed 's/=//g' | sed 's/"//g' | sed 's/PRETTY_NAME//g')"
     sudo apt update -y
     apt-get install --no-install-recommends software-properties-common
-    add-apt-repository ppa:vbernat/haproxy-2.0 -y
-    apt-get -y install haproxy=2.0.\*
+    # Pakai haproxy dari repo bawaan Ubuntu (2.4 di 22.04, 2.8 di 24.04) - PPA lama sering gagal / tidak ada paket untuk rilis baru
+    apt-get -y install haproxy
 elif [[ $(cat /etc/os-release | grep -w ID | head -n1 | sed 's/=//g' | sed 's/"//g' | sed 's/ID//g') == "debian" ]]; then
     echo "Setup Dependencies For OS Is $(cat /etc/os-release | grep -w PRETTY_NAME | head -n1 | sed 's/=//g' | sed 's/"//g' | sed 's/PRETTY_NAME//g')"
     curl https://haproxy.debian.net/bernat.debian.org.gpg |
@@ -252,7 +253,7 @@ function base_package() {
     clear
     ########
     print_install "Menginstall Packet Yang Dibutuhkan"
-    apt install zip pwgen openssl netcat socat cron bash-completion -y
+    apt install zip unzip pwgen openssl netcat socat cron bash-completion -y
     apt install figlet -y
     apt update -y
     apt upgrade -y
@@ -382,6 +383,7 @@ rm -rf /etc/vmess/.vmess.db
     touch /etc/xray/domain
     touch /var/log/xray/access.log
     touch /var/log/xray/error.log
+    chown www-data.www-data /var/log/xray/access.log /var/log/xray/error.log
     touch /etc/vmess/.vmess.db
     touch /etc/vless/.vless.db
     touch /etc/trojan/.trojan.db
@@ -405,7 +407,24 @@ clear
     
     # / / Ambil Xray Core Version Terbaru
 latest_version="$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases | grep tag_name | sed -E 's/.*"v(.*)".*/\1/' | head -n 1)"
+# Fallback ke versi yg sudah terverifikasi jalan kalau API GitHub gagal (rate limit / network)
+if [ -z "$latest_version" ]; then
+    latest_version="26.10.31"
+    echo -e "[ ${yellow}WARN$NC ] Gagal ambil versi terbaru, pakai fallback v${latest_version}"
+fi
 bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install -u www-data --version $latest_version
+
+# Verifikasi binary xray ada; kalau tidak, install langsung dari release zip
+if [ ! -x /usr/local/bin/xray ]; then
+    echo -e "[ ${yellow}WARN$NC ] Binary xray tidak ditemukan, install manual dari release"
+    apt-get install -y unzip >/dev/null 2>&1
+    cd /tmp
+    wget -q "https://github.com/XTLS/Xray-core/releases/download/v${latest_version}/Xray-linux-64.zip" -O Xray-linux-64.zip
+    mkdir -p /tmp/xray-bin && unzip -o Xray-linux-64.zip xray -d /tmp/xray-bin >/dev/null 2>&1
+    install -m 755 /tmp/xray-bin/xray /usr/local/bin/xray
+    rm -rf /tmp/xray-bin /tmp/Xray-linux-64.zip
+    cd - >/dev/null 2>&1
+fi
  
     # // Ambil Config Server
     wget -O /etc/xray/config.json "${REPO}limit/config.json" >/dev/null 2>&1
@@ -788,8 +807,17 @@ systemctl stop ws
 systemctl enable ws
 systemctl start ws
 systemctl restart ws
-wget -q -O /usr/local/share/xray/geosite.dat "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" >/dev/null 2>&1
-wget -q -O /usr/local/share/xray/geoip.dat "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" >/dev/null 2>&1
+# Download geo data dengan verifikasi - jangan timpa file bagus dengan file corrupt / halaman error
+for geofile in geosite.dat geoip.dat; do
+    wget -q -O "/tmp/${geofile}" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/${geofile}" >/dev/null 2>&1
+    if [ -s "/tmp/${geofile}" ] && [ "$(wc -c < "/tmp/${geofile}")" -gt 100000 ] && ! head -c 100 "/tmp/${geofile}" | grep -qi "<html"; then
+        mkdir -p /usr/local/share/xray
+        mv "/tmp/${geofile}" "/usr/local/share/xray/${geofile}"
+    else
+        echo -e "[ ${yellow}WARN$NC ] Download ${geofile} gagal / tidak valid, pakai file yg sudah ada"
+        rm -f "/tmp/${geofile}"
+    fi
+done
 wget -O /usr/sbin/ftvpn "${REPO}limit/ftvpn" >/dev/null 2>&1
 chmod +x /usr/sbin/ftvpn
 iptables -A FORWARD -m string --string "get_peers" --algo bm -j DROP
@@ -852,12 +880,18 @@ print_success "All Packet"
 function menu(){
     clear
     print_install "Memasang Menu Packet"
+    apt-get install -y unzip >/dev/null 2>&1
     wget ${REPO}limit/menu.zip
-    unzip menu.zip
+    unzip -o menu.zip
     chmod +x menu/*
     mv menu/* /usr/local/sbin
     rm -rf menu
     rm -rf menu.zip
+    # Verifikasi jumlah script terpasang (menu.zip berisi ~70 script)
+    menu_count=$(ls /usr/local/sbin/menu /usr/local/sbin/add* /usr/local/sbin/del* /usr/local/sbin/cek* 2>/dev/null | wc -l)
+    if [ "$menu_count" -lt 60 ]; then
+        echo -e "[ ${yellow}WARN$NC ] Hanya $menu_count script menu terpasang (seharusnya ~70), install mungkin tidak lengkap"
+    fi
 }
 
 # Membaut Default Menu 
