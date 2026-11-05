@@ -2,7 +2,7 @@
 ### Color
 apt upgrade -y
 apt update -y
-apt install curls
+apt install curl -y
 apt install wondershaper -y
 Green="\e[92;1m"
 RED="\033[31m"
